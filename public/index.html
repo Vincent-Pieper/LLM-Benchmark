@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LLM Benchmark</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><div><span class="eyebrow">LOCAL WORKBENCH · V1</span><h1>LLM Benchmark</h1><p>Compare model quality and speed on your own PC.</p></div><div class="top-right"><span id="profile-status" class="pill">Local PC</span><span id="ollama-status" class="pill">Checking Ollama…</span><button id="export-btn" class="secondary">Export all data</button></div></header>
+  <main>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <section class="grid two">
+      <article class="card"><div class="card-head"><div><span class="eyebrow">01 · READINESS</span><h2>System Check</h2></div><button id="system-refresh" class="secondary">Refresh</button></div><div id="system-content" class="muted">Checking hardware…</div></article>
+      <article class="card"><div class="card-head"><div><span class="eyebrow">02 · LOCAL LIBRARY</span><h2>Models</h2></div><button id="models-refresh" class="secondary">Refresh</button></div><div id="models-content" class="muted">Checking Ollama…</div><div class="divider"></div><label for="pull-name">Download another Ollama model</label><div class="inline"><input id="pull-name" placeholder="model:tag" autocomplete="off"><button id="pull-btn">Pull model</button></div><p class="hint">Download starts only when you click Pull model. Progress appears below.</p></article>
+    </section>
+
+    <section class="grid two">
+      <article class="card"><div class="card-head"><div><span class="eyebrow">03 · VERSIONED TASKS</span><h2>Test packs</h2></div></div><label for="pack-select">Selected pack</label><select id="pack-select"></select><div id="pack-detail"></div><div class="divider"></div><h3>Generate a draft with Codex CLI</h3><div class="fields two-small"><label>Cloud model<input id="cloud-model" value="gpt-6-astra" autocomplete="off"></label><label>Reasoning effort<select id="cloud-effort"><option value="xhigh">Extra High</option><option value="high">High</option><option value="max">Max</option><option value="ultra">Ultra</option><option value="medium">Medium</option><option value="low">Low</option></select></label></div><details><summary>Review the exact generation prompt</summary><textarea id="cloud-prompt" readonly rows="16"></textarea></details><button id="cloud-btn">Generate draft</button><p class="hint">The prompt contains generic task instructions and no saved answers. Codex CLI runs with a read-only sandbox in an empty work folder.</p><div class="divider"></div><details><summary>Import a JSON pack</summary><textarea id="pack-json" rows="7" placeholder="Paste a complete pack JSON object"></textarea><button id="pack-import">Validate and import draft</button></details></article>
+      <article class="card"><div class="card-head"><div><span class="eyebrow">04 · EXPERIMENT</span><h2>Run setup</h2></div></div><label for="model-select">Installed model</label><select id="model-select"></select><div class="fields three"><label>Repetitions<select id="repetitions"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label><label>Thinking<select id="think"><option value="false">Off</option><option value="true">On</option><option value="default">Model default</option></select></label><label>Context tokens<input id="num-ctx" type="number" min="512" max="131072" value="4096"></label><label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.1" value="0"></label><label>Max output tokens<input id="num-predict" type="number" min="32" max="32768" value="4096"></label></div><h3>Processing limits by level</h3><p class="hint">Minutes per task. Cold model load is measured separately.</p><div class="fields five" id="limits"></div><label class="check"><input id="override-warnings" type="checkbox">I reviewed System Check and want to run despite warnings</label><button id="run-btn" class="primary">Run selected model</button><p class="hint">Run unloads currently loaded Ollama models and tests this setup sequentially. It does not download models or call Codex.</p></article>
+    </section>
+
+    <section class="card"><div class="card-head"><div><span class="eyebrow">05 · LIVE OPERATION</span><h2>Current job</h2></div><button id="check-btn" class="secondary">Check progress / ETA</button></div><div id="job-content" class="muted">No active job.</div><div id="eta-content"></div><div class="inline"><button id="after-btn" class="secondary danger">Stop after current task</button><button id="abort-btn" class="danger">Abort now</button></div></section>
+
+    <section class="card"><div class="card-head"><div><span class="eyebrow">06 · RESULTS</span><h2>Comparison</h2></div><button id="results-refresh" class="secondary">Refresh</button></div><p id="result-hint" class="hint">Quality and speed are shown separately. Pending or failed grading is not zero.</p><div class="table-scroll"><table><thead><tr id="result-head"></tr></thead><tbody id="result-rows"></tbody></table></div><div id="result-detail"></div></section>
+  </main>
+  <footer>Localhost only · Files remain in this project folder · No telemetry</footer>
+</body>
+</html>
