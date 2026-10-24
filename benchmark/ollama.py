@@ -191,13 +191,16 @@ class Ollama:
         return self.request("/generate", {"model": model, "prompt": "", "stream": False,
                                           "keep_alive": "10m"}, stop)
 
-    def generate(self, model, prompt, think, options, stop=None, images=None):
+    def generate(self, model, prompt, think, options, stop=None, images=None,
+                 format_schema=None):
         body = {"model": model, "prompt": prompt, "stream": True, "keep_alive": "10m",
                 "options": options}
         if think is not None:
             body["think"] = think
         if images:
             body["images"] = images
+        if format_schema is not None:
+            body["format"] = format_schema
         responses, thoughts, final = [], [], None
         def collect(item):
             nonlocal final

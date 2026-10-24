@@ -9,7 +9,7 @@ import secrets
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
 from benchmark.categories import CATEGORIES
@@ -20,11 +20,15 @@ from benchmark.projection import project_run, valid_limits
 from benchmark.runner import Runner
 from benchmark.store import Store, now
 from benchmark.system import codex_exe, snapshot
+from benchmark.telemetry import read_samples
 
 ROOT = Path(__file__).resolve().parent
 HOST, PORT = "127.0.0.1", 37843
 STATIC = {"/": ("index.html", "text/html"), "/index.html": ("index.html", "text/html"),
-          "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
+          "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css"),
+          "/comparison.js": ("comparison.js", "text/javascript"),
+          "/results_ui.js": ("results_ui.js", "text/javascript"),
+          "/results.css": ("results.css", "text/css")}
 CSP = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'"
 
 
@@ -46,9 +50,10 @@ class App:
         self.runner = runner or Runner(self.store, self.ollama, self.root, system_snapshot)
         self.token = secrets.token_hex(32)
 
-    def get(self, path):
+    def get(self, path, params=None):
+        params = params or {}
         if path == "/api/health":
-            return 200, {"name": "llm-benchmark", "version": "0.2.0"}
+            return 200, {"name": "llm-benchmark", "version": "0.3.0"}
         if path == "/api/state":
             return 200, {**self.store.snapshot(),
                          "categories": [{"id": c.id, "label": c.label, "type": c.type}
@@ -70,8 +75,17 @@ class App:
             return 200, self.runner.status()
         if path == "/api/job/check":
             return 200, self.runner.check()
+        if path == "/api/telemetry":
+            run_id = params.get("runId", [None])[0]
+            if not self.store.run(run_id):
+                raise LookupError("Run not found")
+            return 200, {"runId": run_id, "samples": read_samples(self.store.file.parent, run_id)}
         if path == "/api/export":
-            return 200, self.store.snapshot()
+            exported = self.store.snapshot()
+            for run in exported["runs"]:
+                if run.get("telemetry"):
+                    run["telemetrySamples"] = read_samples(self.store.file.parent, run["id"])
+            return 200, exported
         raise LookupError("Unknown API endpoint")
 
     def post(self, path, body):
@@ -220,7 +234,7 @@ def handler_for(app):
                     return
                 path = urlsplit(self.path).path
                 if path.startswith("/api/"):
-                    code, value = app.get(path)
+                    code, value = app.get(path, parse_qs(urlsplit(self.path).query))
                     self._json(code, value, export=path == "/api/export")
                 else:
                     self._static(path)
@@ -261,6 +275,9 @@ def main():
         print(f"Could not start on http://{HOST}:{PORT}: {exc}", file=sys.stderr)
         return 1
     server.daemon_threads = True
+    reviewed = app.store.backfill_format_reviews()
+    if reviewed:
+        print(f"Reviewed {reviewed} saved answers; original scores remain unchanged.", flush=True)
     print(f"LLM Benchmark is running at http://{HOST}:{PORT}", flush=True)
     print("Close this window to stop the app.", flush=True)
     if os.environ.get("BENCHMARK_NO_BROWSER") != "1":

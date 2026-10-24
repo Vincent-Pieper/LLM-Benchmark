@@ -233,6 +233,8 @@ class BackendTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertEqual("completed", runner.status()["status"], runner.status())
             self.assertEqual(60, len(store.state["runs"][0]["tasks"]))
+            self.assertEqual("complete", store.state["runs"][0]["telemetry"]["status"])
+            self.assertGreaterEqual(store.state["runs"][0]["telemetry"]["sampleCount"], 2)
             self.assertEqual(12, len(project_run(store.state["runs"][0], [60] * 5)["categories"]))
 
     def test_subjective_normalization_and_projection(self):

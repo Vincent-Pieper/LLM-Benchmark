@@ -4,10 +4,13 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import threading
 from datetime import datetime, timezone
+from .categories import REGISTRY
 from .core import content_hash, new_id, validate_pack
+from .format_review import review_format
 
 
 def now():
@@ -67,3 +70,33 @@ class Store:
     def run(self, run_id):
         with self.lock:
             return next((run for run in self.state["runs"] if run["id"] == run_id), None)
+
+    def backfill_format_reviews(self):
+        """Preserve original grades while adding versioned reviews to saved answers."""
+        with self.lock:
+            packs = {pack["id"]: pack for pack in self.state["packs"]}
+            changed = 0
+            for run in self.state["runs"]:
+                pack = packs.get(run.get("packId"))
+                if not pack or pack.get("hash") != run.get("packHash"):
+                    continue
+                tasks = {task["id"]: task for task in pack["tasks"]}
+                for record in run.get("tasks", []):
+                    task = tasks.get(record.get("taskId"))
+                    if (not task or record.get("formatReview") or record.get("status") != "scored"
+                            or not isinstance(record.get("raw"), str)
+                            or REGISTRY[task["category"]].type != "objective"):
+                        continue
+                    if (task["category"] in {"research", "tools"} and
+                            not any(item.get("ok") for item in record.get("toolTrace", []))):
+                        continue
+                    review = review_format(task, record["raw"], record)
+                    if review:
+                        record["formatReview"] = review
+                        changed += 1
+            if changed:
+                backup = self.file.with_name("state.before-format-review-v1.json")
+                if self.file.exists() and not backup.exists():
+                    shutil.copy2(self.file, backup)
+                self.save()
+            return changed

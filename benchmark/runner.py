@@ -2,7 +2,6 @@
 from __future__ import annotations
 import copy
 from datetime import datetime, timedelta, timezone
-import json
 import math
 import re
 import statistics
@@ -10,10 +9,14 @@ import threading
 import time
 from .categories import CATEGORIES, REGISTRY
 from .cloud import generate_pack
-from .core import content_hash, grade_objective, new_id, normalize_judge, pack_categories
+from .core import content_hash, grade_objective, new_id, pack_categories
+from .format_review import review_format
+from .judging import (JUDGE_OPTIONS, SCHEMA_VERSION, JudgeOutputError,
+                      judge_prompt, judge_schema, parse_judge_answer)
 from .projection import valid_limits
 from .store import now
 from .system import snapshot
+from .telemetry import TelemetryRecorder, INTERVAL_SECONDS
 from .task_io import run_tools, run_vision
 
 
@@ -26,9 +29,11 @@ def ordered_tasks(pack):
 
 
 class Runner:
-    def __init__(self, store, ollama, root, system_snapshot=snapshot, cloud_generator=generate_pack):
+    def __init__(self, store, ollama, root, system_snapshot=snapshot, cloud_generator=generate_pack,
+                 telemetry_factory=TelemetryRecorder):
         self.store, self.ollama, self.root = store, ollama, root
         self.system_snapshot, self.cloud_generator = system_snapshot, cloud_generator
+        self.telemetry_factory = telemetry_factory
         self.lock = threading.RLock()
         self.job = None
         self.stop = None
@@ -110,8 +115,8 @@ class Runner:
             raise ValueError("Invalid context size")
         if type(temperature) not in (float, int) or not math.isfinite(temperature) or not 0 <= temperature <= 2:
             raise ValueError("Invalid temperature")
-        if type(predict) is not int or not 32 <= predict <= 32768:
-            raise ValueError("Invalid output token limit")
+        if type(predict) is not int or (predict != -1 and not 32 <= predict <= 32768):
+            raise ValueError("Output token limit must be -1 (open-ended) or 32–32768")
         if config.get("think") not in (True, False, None):
             raise ValueError("think must be true, false, or default")
         prior = self.store.run(retry_of) if retry_of else None
@@ -133,7 +138,8 @@ class Runner:
                                      "num_predict": predict}},
                "limitsSec": list(limits), "repetitions": repetitions, "tasks": old_records,
                "retryOf": retry_of, "systemBefore": system_before, "coldLoadMs": None,
-               "ollamaVersion": None, "error": None}
+               "ollamaVersion": None, "error": None,
+               "telemetry": {"intervalSec": INTERVAL_SECONDS, "status": "pending"}}
         self._start("benchmark", f'{config["model"]} · {pack["name"]}')
         with self.lock:
             self.job["runId"] = run["id"]
@@ -146,7 +152,18 @@ class Runner:
         return run
 
     def _benchmark_safe(self, run, pack):
+        recorder = None
+        final_status = None
+        final_detail = None
         try:
+            try:
+                recorder = self.telemetry_factory(self.store.file.parent, run["id"])
+                recorder.start()
+                self.store.update(lambda state: run["telemetry"].update(status="recording"))
+            except Exception as exc:
+                recorder = None
+                self.store.update(lambda state: run["telemetry"].update(
+                    status="unavailable", errors=[str(exc)[:300]]))
             self._benchmark(run, pack)
         except Exception as exc:
             try:
@@ -156,8 +173,20 @@ class Runner:
             stopped = self.job.get("abortReason") == "user"
             self.store.update(lambda state: run.update(
                 status="aborted" if stopped else "failed", error=str(exc), endedAt=now()))
-            self._finish("aborted" if stopped else "failed",
-                         "Stopped by user; completed tasks saved" if stopped else str(exc))
+            final_status = "aborted" if stopped else "failed"
+            final_detail = "Stopped by user; completed tasks saved" if stopped else str(exc)
+        finally:
+            if recorder is not None:
+                try:
+                    summary = recorder.stop()
+                    self.store.update(lambda state: run["telemetry"].update(
+                        status="partial" if summary["errors"] else "complete", **summary))
+                except Exception as exc:
+                    self.store.update(lambda state: run["telemetry"].update(
+                        status="unavailable", errors=[str(exc)[:300]]))
+            self._finish(final_status or run["status"], final_detail or
+                         ("Stopped; completed tasks saved" if run["status"] == "aborted" else
+                          "Benchmark complete; subjective answers may await judging"))
 
     def _benchmark(self, run, pack):
         model = self._require_model(run["setup"]["model"])
@@ -238,6 +267,10 @@ class Runner:
                         base.update(grade_objective(task, result["response"]))
                         if category.mode == "tools" and not result["validToolCalls"]:
                             base.update(score=0, reason="No successful local tool call")
+                        else:
+                            format_review = review_format(task, result["response"], base)
+                            if format_review:
+                                base["formatReview"] = format_review
                     elif not result["response"].strip():
                         base.update(score=0, reason="Empty final answer")
                     self._save_task(run, task, repetition,
@@ -270,9 +303,6 @@ class Runner:
             self.ollama.unload(run["setup"]["model"])
         except Exception as exc:
             self.store.update(lambda state: run.update(unloadWarning=str(exc)))
-        self._finish("aborted" if stopped else "completed",
-                     "Stopped; completed tasks saved" if stopped else
-                     "Benchmark complete; subjective answers may await judging")
 
     def _save_task(self, run, task, repetition, status, **data):
         record = {"taskId": task["id"], "category": task["category"], "level": task["level"],
@@ -335,6 +365,7 @@ class Runner:
         return self.status()
 
     def _judge(self, run, pack, judge_model, eligible):
+        failures = 0
         try:
             self._require_model(judge_model)
             self._unload_all()
@@ -346,22 +377,12 @@ class Runner:
                 with self.lock:
                     self.job["progress"] = {"taskId": record["taskId"],
                                              "repetition": record["repetition"], "startedAt": now()}
-                prompt = (
-                    "You are grading a blind candidate answer. The model identity is hidden. "
-                    "Compare meaning, not wording; accept other valid reasoning. Use the reference "
-                    "only as a full-credit guide, not as the only allowed wording. Penalize claims "
-                    "unsupported by the passage. Return JSON only: "
-                    '{"scores":[{"id":"criterion id","earned":number}],"rationale":"brief evidence"}. '
-                    "Every criterion id must appear once.\n\n"
-                    f'Passage: {task["passage"]}\nQuestion: {task["question"]}\n'
-                    f'Full-credit reference: {task["reference"]}\n'
-                    f'Rubric: {json.dumps(task["criteria"], ensure_ascii=False)}\n'
-                    f'Candidate answer: {record["raw"]}')
+                result = None
                 try:
-                    answer = self.ollama.generate(judge_model, prompt, False,
-                                                  {"temperature": 0, "num_ctx": 8192,
-                                                   "num_predict": 1024}, self.stop)
-                    grade = normalize_judge(task, json.loads(answer["response"]))
+                    result = self.ollama.generate(
+                        judge_model, judge_prompt(task, record["raw"]), False,
+                        dict(JUDGE_OPTIONS), self.stop, format_schema=judge_schema(task))
+                    grade = parse_judge_answer(task, result)
                     def apply(state):
                         if isinstance(record.get("score"), (int, float)) and record.get("judge"):
                             record.setdefault("gradeHistory", []).append({
@@ -370,23 +391,41 @@ class Runner:
                         record.update(grade)
                         record.update(status="scored", judge={
                             "model": judge_model, "gradedAt": now(),
-                            "rubricHash": content_hash(task["criteria"]), "raw": answer["response"]},
+                            "rubricHash": content_hash(task["criteria"]),
+                            "schemaVersion": SCHEMA_VERSION, "options": dict(JUDGE_OPTIONS),
+                            "raw": result["response"], "metrics": result.get("metrics")},
                             regradeError=None)
                     self.store.update(apply)
                 except Exception as exc:
                     if self.stop.is_set():
                         break
-                    self.store.update(lambda state: record.update(
-                        {"regradeError": str(exc)} if isinstance(record.get("score"), (int, float))
-                        else {"status": "judge_error", "reason": str(exc)}))
-            self._finish("aborted" if self.stop.is_set() else "completed",
-                         "Judging stopped by user" if self.stop.is_set() else
-                         "Judging finished; inspect the rubric breakdowns")
+                    failures += 1
+                    failure = {"model": judge_model, "failedAt": now(),
+                               "kind": exc.kind if isinstance(exc, JudgeOutputError) else "request_error",
+                               "message": str(exc)[:600], "schemaVersion": SCHEMA_VERSION,
+                               "options": dict(JUDGE_OPTIONS),
+                               "raw": result.get("response") if result else None,
+                               "thinking": result.get("thinking") if result else None,
+                               "metrics": result.get("metrics") if result else None}
+                    def save_failure(state):
+                        record.setdefault("judgeFailures", []).append(failure)
+                        if isinstance(record.get("score"), (int, float)):
+                            record["regradeError"] = str(exc)
+                        else:
+                            record.update(status="judge_error", reason=str(exc))
+                    self.store.update(save_failure)
         finally:
             try:
                 self.ollama.unload(judge_model)
             except Exception:
                 pass
+        if self.stop.is_set():
+            self._finish("aborted", "Judging stopped by user")
+        elif failures:
+            self._finish("completed_with_errors",
+                         f"Judging finished with {failures} ungraded or failed regrade(s)")
+        else:
+            self._finish("completed", "Judging finished; inspect the rubric breakdowns")
 
     def check(self):
         if not self.busy() or self.job["type"] != "benchmark":

@@ -61,40 +61,47 @@ function renderLimits() {
 function readLimits() { const values=[1,2,3,4,5].map(i=>Number($(`limit-${i}`).value)*60); if(values.some(n=>!Number.isInteger(n)||n<1||n>86400))throw new Error('Each task limit must be between 1 and 1440 minutes');return values; }
 async function saveSettings() { await post('/api/settings',{limitsSec:readLimits(),repetitions:+$('repetitions').value,judgeModel:state.settings.judgeModel || ''}); }
 
-function catScore(run,category) {
-  const totals=[];let observed=0,pending=false;
-  for(let rep=1;rep<=run.repetitions;rep++){
-    const records=run.tasks.filter(t=>t.repetition===rep&&t.category===category);
-    observed+=records.filter(t=>Number.isFinite(t.score)).reduce((sum,t)=>sum+t.score,0);
-    if(records.length===5&&records.every(t=>Number.isFinite(t.score)))totals.push(records.reduce((sum,t)=>sum+t.score,0));
-    else pending=true;
-  }
-  if(!totals.length)return {number:null,label:`${fmt(observed)} · pending`,pending:true};
-  const mean=totals.reduce((a,b)=>a+b,0)/totals.length;
-  const sd=Math.sqrt(totals.reduce((s,n)=>s+(n-mean)**2,0)/totals.length);
-  return {number:mean,label:`${fmt(mean)}${totals.length>1?` ± ${fmt(sd)}`:''}${pending?' · partial':''}`,pending};
-}
-function speed(run){const rates=run.tasks.filter(t=>t.metrics?.evalCount&&t.metrics?.evalNs).map(t=>t.metrics.evalCount/(t.metrics.evalNs/1e9));return rates.length?rates.reduce((a,b)=>a+b,0)/rates.length:null;}
 function renderResults() {
-  const rows=$('result-rows');
   const pack=chosenPack();
   const categoryIds=pack?.categoryIds || [...new Set((pack?.tasks||[]).map(t=>t.category))];
   const categories=(state.categories || []).filter(c=>categoryIds.includes(c.id));
   const runs=pack ? state.runs.filter(run=>run.packHash===pack.hash) : [];
-  $('result-head').innerHTML=`<th>Setup</th><th>Pack</th>${categories.map(c=>`<th>${esc(c.label)} / 50</th>`).join('')}<th>Total / ${categories.length*50}</th><th>Speed</th><th>Run</th>`;
-  $('result-hint').textContent=`Showing runs for the selected pack. Unweighted quality: 10 points × 5 levels × ${categories.length} categories = ${categories.length*50}. Speed and cold load are separate. Pending grading is not zero.`;
-  if(!runs.length){rows.innerHTML=`<tr><td colspan="${categories.length+5}" class="muted">No runs for this pack yet. Select another pack to see its saved results.</td></tr>`;$('result-detail').innerHTML='';return;}
+  $('result-hint').textContent=`${pack?.approved?'Approved':'Draft'} pack · ${categories.length} areas × 50 points. A small F marks content scores after a safe format repair; raw grades remain available. Speed and cold load are separate.`;
   if(!runs.some(run=>run.id===selectedRun))selectedRun=null;
-  rows.innerHTML=[...runs].reverse().map(run=>{
-    const cats=categories.map(c=>catScore(run,c.id));
-    const all=cats.every(c=>!c.pending&&c.number!==null);
-    const total=cats.reduce((sum,c)=>sum+(c.number||0),0);
-    const setup=`${run.setup.model} · ${run.setup.details?.quantization_level || '?'} · ${run.setup.think===null?'default':run.setup.think?'think':'no think'} · ctx ${run.setup.options.num_ctx}`;
-    const different=chosenPack()?.hash!==run.packHash;
-    return `<tr data-run="${esc(run.id)}" class="${selectedRun===run.id?'active':''}"><td><strong>${esc(run.setup.model)}</strong><small>${esc(setup)}</small><small>digest ${esc(run.setup.digest?.slice(0,12))}</small></td><td>${esc(run.packName)}<small>v${esc(run.packVersion)}${different?' · different from selected pack':''}</small></td>${cats.map(c=>`<td>${esc(c.label)}</td>`).join('')}<td><strong>${fmt(total)}</strong>${all?'':'<small>incomplete</small>'}</td><td>${speed(run)?`${fmt(speed(run))} tok/s`:'—'}<small>load ${run.coldLoadMs===null?'—':fmt(run.coldLoadMs/1000)+' s'}</small></td><td><span class="tag ${run.status==='completed'?'good':run.status==='failed'?'bad':'warn'}">${esc(run.status)}</span><small>${esc(when(run.startedAt))}</small></td></tr>`;
-  }).join('');
-  rows.querySelectorAll('tr[data-run]').forEach(tr=>tr.onclick=()=>{selectedRun=tr.dataset.run;renderResults();});
+  window.BenchmarkResultsUI.render({runs,allRuns:state.runs,categories,selectedRun,onSelect:id=>{selectedRun=id;renderResults();}});
   renderResultDetail();
+}
+function taskMetrics(record) {
+  const metrics=record.metrics||{};
+  const tokens=Number(metrics.evalCount),ns=Number(metrics.evalNs);
+  const rate=tokens>0&&ns>0?tokens*1e9/ns:null;
+  return `<div class="task-metrics"><span>Total ${Number.isFinite(record.processingMs)?fmt(record.processingMs/1000)+'s':'—'}</span><span>Input ${fmt(metrics.promptEvalCount)} tokens · ${Number.isFinite(metrics.promptEvalNs)?fmt(metrics.promptEvalNs/1e9)+'s':'—'}</span><span>Output ${fmt(metrics.evalCount)} tokens · ${Number.isFinite(metrics.evalNs)?fmt(metrics.evalNs/1e9)+'s':'—'}</span><span>${fmt(rate)} tok/s</span></div>`;
+}
+function judgeFailureDetails(record) {
+  const failures=record.judgeFailures||[];
+  if(!failures.length)return '';
+  return `<details><summary>Judge failures (${failures.length})</summary>${failures.map((failure,index)=>`<details><summary>Attempt ${index+1} · ${esc(failure.model)} · ${esc(failure.kind)} · ${esc(when(failure.failedAt))}</summary><p class="hint">${esc(failure.message)} · done reason ${esc(failure.metrics?.doneReason||'unknown')} · output tokens ${fmt(failure.metrics?.evalCount)} · format ${esc(failure.schemaVersion||'unknown')}</p><details><summary>Raw judge response</summary><pre>${esc(failure.raw??'(no response)')}</pre></details><details><summary>Judge thinking output</summary><pre>${esc(failure.thinking??'(not returned)')}</pre></details></details>`).join('')}</details>`;
+}
+function taskDetails(run,pack) {
+  const order=state.categories.map(category=>category.id);
+  const records=[...run.tasks].sort((a,b)=>a.repetition-b.repetition||order.indexOf(a.category)-order.indexOf(b.category)||a.level-b.level);
+  return `<details open><summary>Tasks · time, tokens and raw answers</summary>${records.map(record=>{
+    const task=pack?.tasks.find(item=>item.id===record.taskId);
+    const score=window.BenchmarkComparison.scoreOf(record);
+    const review=record.formatReview;
+    const scoreLabel=score===null?'unscored':`${fmt(score)}/10`;
+    return `<details class="task"><summary>Rep ${esc(record.repetition)} · ${esc(record.category)} ${esc(record.level)} · <span class="status ${esc(record.status)}">${esc(record.status)}</span> · <span class="score-chip">${esc(scoreLabel)}</span>${review?.originalFormatValid===false?'<span class="format-marker" title="Content scored after a simple format repair" aria-label="Format-adjusted answer">F</span>':''}</summary>${taskMetrics(record)}<p class="hint">${esc(record.reason||'')}</p>${review?`<p class="hint">Format repair ${esc(review.adapter)} · Original score ${fmt(review.strictScore)}/10 · content score ${fmt(review.contentScore)}/10 · review ${esc(review.version)}</p>`:''}${judgeFailureDetails(record)}${task?`<details><summary>Task and reference</summary><pre>${esc(JSON.stringify(task,null,2))}</pre></details>`:''}${record.raw!==undefined?`<details><summary>Raw model answer</summary><pre>${esc(record.raw)}</pre></details>`:''}${record.breakdown?`<pre>${esc(JSON.stringify(record.breakdown,null,2))}</pre>`:''}</details>`;
+  }).join('')}</details>`;
+}
+async function loadTelemetry(run) {
+  const holder=$('telemetry-content');
+  if(!holder)return;
+  try {
+    const {samples}=await get(`/api/telemetry?runId=${encodeURIComponent(run.id)}`);
+    if(!$('telemetry-content'))return;
+    if(!samples.length){holder.textContent='No samples recorded for this run.';return;}
+    holder.innerHTML=`<p class="hint">${samples.length} local samples. GPU energy covers the whole GPU, not just Ollama. Short tasks may finish between samples.</p><div class="telemetry-scroll"><table><thead><tr><th>Time</th><th>CPU</th><th>Free RAM</th><th>GPU</th><th>VRAM</th><th>Clock</th><th>GPU power</th><th>Temp</th><th>Sample cost</th></tr></thead><tbody>${samples.map(sample=>`<tr><td>${esc(when(sample.at))}</td><td>${fmt(sample.cpuPercent)}%</td><td>${fmt(sample.freeRamGiB)} GiB</td><td>${fmt(sample.gpu?.utilizationPercent)}%</td><td>${fmt(sample.gpu?.usedMiB)} MiB</td><td>${fmt(sample.gpu?.clockMHz)} MHz</td><td>${fmt(sample.gpu?.powerW)} W</td><td>${fmt(sample.gpu?.temperatureC)} °C</td><td>${fmt(sample.sampleMs)} ms</td></tr>`).join('')}</tbody></table></div>`;
+  } catch(error) { if(holder)holder.textContent=error.message; }
 }
 function renderResultDetail() {
   const el=$('result-detail'),run=state.runs.find(r=>r.id===selectedRun);
@@ -102,14 +109,18 @@ function renderResultDetail() {
   const pack=state.packs.find(p=>p.id===run.packId);
   const pending=run.tasks.filter(t=>t.status==='subjective_pending'||t.status==='judge_error').length;
   const retryable=run.status!=='completed'||run.tasks.some(t=>['timed_out','skipped_due_to_limit','technical_error','aborted'].includes(t.status));
-  el.innerHTML=`<div class="divider"></div><h3>${esc(run.setup.model)} · ${esc(run.id.slice(0,8))}</h3><p class="hint">${esc(run.repetitions)} repetition(s) · ${esc(run.ollamaVersion||'Ollama version unknown')} · ${esc(run.packHash.slice(0,16))} · started ${esc(when(run.startedAt))}</p>${run.error?`<p class="tag bad">${esc(run.error)}</p>`:''}<div class="inline">${pending?`<select id="judge-model">${(library?.models||[]).map(m=>`<option value="${esc(m.name)}">Judge with ${esc(m.name)}</option>`).join('')}</select><button id="judge-btn">Judge ${pending} answer(s)</button>`:''}<button id="project-btn" class="secondary">Preview current time limits</button>${retryable?'<button id="retry-btn" class="secondary">Retry incomplete tasks with current limits</button>':''}</div><div id="projection-content"></div><details open><summary>Task records and raw answers</summary>${[...run.tasks].sort((a,b)=>a.repetition-b.repetition||(state.categories.findIndex(c=>c.id===a.category)-state.categories.findIndex(c=>c.id===b.category))||a.level-b.level).map(t=>{const task=pack?.tasks.find(x=>x.id===t.taskId);return `<details class="task"><summary>Rep ${esc(t.repetition)} · ${esc(t.category)} ${esc(t.level)} · <span class="status ${esc(t.status)}">${esc(t.status)}</span> · ${Number.isFinite(t.score)?esc(t.score)+'/10':'unscored'}</summary><p class="hint">${esc(t.reason||'')} · processing ${Number.isFinite(t.processingMs)?fmt(t.processingMs/1000)+' s':'—'} · ${t.metrics?.evalCount?`${esc(t.metrics.evalCount)} output tokens`:''}</p>${task?`<details><summary>Task and reference</summary><pre>${esc(JSON.stringify(task,null,2))}</pre></details>`:''}${t.raw!==undefined?`<details><summary>Raw model answer</summary><pre>${esc(t.raw)}</pre></details>`:''}${t.breakdown?`<pre>${esc(JSON.stringify(t.breakdown,null,2))}</pre>`:''}</details>`;}).join('')}</details>`;
+  const telemetry=run.telemetry;
+  const telemetryLabel=telemetry?`${esc(telemetry.status)} · ${fmt(telemetry.sampleCount)} samples · median query ${fmt(telemetry.medianSampleMs)} ms · observed whole-GPU energy ${fmt(telemetry.gpuEnergyWh)} Wh`:'No telemetry was collected for this historical run';
+  el.innerHTML=`<div class="divider"></div><h3>${esc(run.setup.model)} · ${esc(run.id.slice(0,8))}</h3><p class="hint">${esc(run.repetitions)} repetition(s) · ${esc(run.ollamaVersion||'Ollama version unknown')} · ${esc(run.packHash.slice(0,16))} · started ${esc(when(run.startedAt))}</p><p class="hint">Quantization ${esc(run.setup.details?.quantization_level||'unknown')} · Context ${esc(run.setup.options?.num_ctx??'unknown')} · Model digest ${esc(run.setup.digest||'unknown')}</p>${pending?`<p class="hint">${pending} subjective answer(s) still need a valid judge grade; the final score remains incomplete until they are graded.</p>`:''}${run.error?`<p class="tag bad">${esc(run.error)}</p>`:''}<div class="inline">${pending?`<select id="judge-model">${(library?.models||[]).map(m=>`<option value="${esc(m.name)}">Judge with ${esc(m.name)}</option>`).join('')}</select><button id="judge-btn">Judge ${pending} answer(s)</button>`:''}<button id="project-btn" class="secondary">Preview current time limits</button>${retryable?'<button id="retry-btn" class="secondary">Retry incomplete tasks with current limits</button>':''}</div><div id="projection-content"></div><details id="telemetry-detail"><summary>System samples · ${telemetryLabel}</summary><div id="telemetry-content">Open to load local samples.</div></details>${taskDetails(run,pack)}`;
+  $('telemetry-detail').ontoggle=()=>{if($('telemetry-detail').open)loadTelemetry(run);};
   $('project-btn').onclick=guard(async()=>{const projection=await post('/api/runs/project',{runId:run.id,limitsSec:readLimits()});$('projection-content').innerHTML=`<p class="hint">Preview only; original run data is unchanged. ${projection.categories.map(c=>`${esc(c.category)}: ${c.score===null?'needs retry':fmt(c.score)+'/50'}`).join(' · ')} · Total: ${projection.total===null?'incomplete':fmt(projection.total)}</p><details><summary>Projected task statuses</summary><pre>${esc(JSON.stringify(projection.records,null,2))}</pre></details>`;});
-  if(pending){$('judge-btn').onclick=guard(async()=>{const model=$('judge-model').value;if(!model)throw new Error('Choose an installed judge model');if(!confirm(`Run the local judge ${model}? This unloads loaded Ollama models and scores the saved answers.`))return;await post('/api/judge',{runId:run.id,judgeModel:model});notice('Local judging started.');});}
+  if(pending){$('judge-btn').onclick=guard(async()=>{const model=$('judge-model').value;if(!model)throw new Error('Choose an installed judge model');if(!confirm(`Run the local judge ${model} on ${pending} saved answer(s)? This unloads loaded Ollama models. Each grading request uses a JSON schema and may generate up to 4096 tokens.`))return;await post('/api/judge',{runId:run.id,judgeModel:model});notice('Local judging started.');});}
   if(run.tasks.some(t=>state.categories.some(c=>c.id===t.category&&c.type==='subjective')&&typeof t.raw==='string'&&t.raw.trim())){
+    const regradeCount=run.tasks.filter(t=>state.categories.some(c=>c.id===t.category&&c.type==='subjective')&&typeof t.raw==='string'&&t.raw.trim()).length;
     const actions=el.querySelector('.inline');
     if(!$('judge-model')){const select=document.createElement('select');select.id='judge-model';for(const model of library?.models||[]){const option=document.createElement('option');option.value=model.name;option.textContent=`Judge with ${model.name}`;select.append(option);}actions.prepend(select);}
     const button=document.createElement('button');button.className='secondary';button.textContent='Rejudge saved subjective answers';actions.append(button);
-    button.onclick=guard(async()=>{const model=$('judge-model').value;if(!model)throw new Error('Choose an installed judge model');if(!confirm(`Rejudge saved subjective answers with ${model}? Previous grades remain in history.`))return;await post('/api/judge',{runId:run.id,judgeModel:model,rejudge:true});notice('Rejudging started.');});
+    button.onclick=guard(async()=>{const model=$('judge-model').value;if(!model)throw new Error('Choose an installed judge model');if(!confirm(`Rejudge all ${regradeCount} saved subjective answers with ${model}? Loaded Ollama models will be unloaded. Each request uses a JSON schema and may generate up to 4096 tokens. Previous grades remain in history.`))return;await post('/api/judge',{runId:run.id,judgeModel:model,rejudge:true});notice('Rejudging started.');});
   }
   const gradeHistory=run.tasks.filter(t=>t.gradeHistory?.length).map(t=>({taskId:t.taskId,repetition:t.repetition,previousGrades:t.gradeHistory}));
   if(gradeHistory.length)el.insertAdjacentHTML('beforeend',`<details><summary>Previous subjective grades</summary><pre>${esc(JSON.stringify(gradeHistory,null,2))}</pre></details>`);
@@ -140,6 +151,7 @@ async function init(){
   $('system-refresh').onclick=guard(refreshSystem);
   $('models-refresh').onclick=guard(refreshModels);
   $('results-refresh').onclick=guard(refreshState);
+  $('wide-results').onclick=()=>window.BenchmarkResultsUI.setWide();
   $('pack-select').onchange=()=>{renderPackDetail();renderResults();};
   $('export-btn').onclick=()=>{window.location.href='/api/export';};
   $('pull-btn').onclick=guard(async()=>{const model=$('pull-name').value.trim();if(!model)throw new Error('Enter an Ollama model name');if(!confirm(`Download ${model} through Ollama now? The model may be large and the progress will be shown here.`))return;await post('/api/models/pull',{model});notice(`Download of ${model} started.`);});

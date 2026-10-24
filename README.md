@@ -1,4 +1,4 @@
-# LLM Benchmark 0.2
+# LLM Benchmark 0.3
 
 Local Ollama benchmark app with a Python backend and a browser interface. Run
 `Start Benchmark.cmd` to open the app. It listens only on
@@ -8,6 +8,44 @@ only the Python standard library.
 The app keeps its state in `data/state.json`. This folder is ignored by Git:
 it contains model answers, benchmark packs, hardware details and run history.
 The existing JavaScript version is preserved in a separate local folder.
+
+The Results table can group runs by model or show every setup separately.
+Three fixed-width setup tags show thinking mode, temperature, and output limit.
+Thinking on/off have distinct colors, temperature uses a fixed 0–2 color
+range, and finite output limits use a blue range anchored to the minimum and
+maximum across all saved runs; open output has a separate pink color. Filters
+still cover quantization, context size, model version, and the other setup
+options. Click a score, task time, or
+token-speed heading to sort; further clicks on other headings add tie-breakers.
+Each area shows five level bars, score variation across repetitions, median
+area time, and output tokens per second. Expand a run for time, input and
+output token counts, output speed, and the raw answer for every task. Cold
+model load is displayed separately. The wide-view button expands the table.
+
+Some objective answers have correct content in a simple wrong wrapper, such
+as an unambiguous bare `[{"id": ..., "answer": ...}]` array instead of an
+`{"answers": [...]}` object. A versioned, deterministic review can score that
+content without changing the original answer or strict grade. A small F marker
+identifies results using such a review. Ambiguous, incomplete, or invalid
+answers are never repaired. On the first v0.3 launch, saved objective answers
+are reviewed too; `data/state.before-format-review-v1.json` is created before
+any changes. The original strict scores remain in `data/state.json`, and the
+interface shows both scores for reviewed tasks. Historical pack versions and
+the draft warning are retained.
+
+New benchmark runs also collect local CPU, RAM, and NVIDIA GPU samples every
+30 seconds, with a sample at the start and end. GPU utilization, used VRAM,
+clock, power and temperature are stored in `data/telemetry/<run-id>.jsonl`,
+apart from the main state file. The run detail displays those samples, and
+the data export includes them. Any energy estimate represents the *whole
+GPU* during covered sample intervals, including other activity; it is not a
+measurement of Ollama alone or of total PC energy. Old runs have no telemetry.
+The `scripts/probe_telemetry.py` command measures the sampling query cost
+without starting a model; it does not establish the impact on model throughput.
+
+Set Max output tokens to `-1` for open-ended output when testing thinking
+models. Per-task processing time limits still apply. No model is loaded or
+tested merely by opening the app.
 
 Imported packs start as drafts. Review and approve them in the app before a
 benchmark can run. Clicking a run, download, cloud generation, or judge action
@@ -50,4 +88,15 @@ py -3 -m unittest discover -s tests -v
 The scorer for subjective answers is still experimental. Empty final answers
 now receive zero automatically, but a local judge can still over-credit an
 incomplete answer; inspect its raw answer and rubric before relying on those
-scores. Existing grades are retained unchanged.
+scores. Existing strict grades are retained unchanged.
+
+Local judging now requests a JSON schema from Ollama and validates every
+criterion after parsing. It requests non-thinking output with a 4096-token
+ceiling; there is no automatic retry. A failed judge attempt keeps its model
+name, available raw response and thinking output, stop reason, token metrics
+and error in the local run record. It does not overwrite an existing grade.
+The job reports `completed_with_errors` when any answer remains ungraded or a
+regrade fails;
+open the run and choose `Judge N answer(s)` to retry only ungraded answers.
+Judging starts only after you confirm that action. Older failed attempts lack
+raw judge output because earlier versions did not record it.

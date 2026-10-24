@@ -37,7 +37,10 @@ def project_run(run, limits):
                 else:
                     if original["status"] == "timed_out":
                         blocked = True
-                    records.append({**base, "status": original["status"], "score": original.get("score"),
+                    review = original.get("formatReview") or {}
+                    effective = review.get("contentScore", original.get("score"))
+                    records.append({**base, "status": original["status"], "score": effective,
+                                    "strictScore": original.get("score") if review else None,
                                     "reason": original.get("reason", "")})
     category_scores = []
     for category_id in category_ids:
