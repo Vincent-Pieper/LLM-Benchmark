@@ -24,7 +24,7 @@ class Ollama:
             active.close()
 
     @contextmanager
-    def _response(self, route, body=None, stop: threading.Event | None = None):
+    def _response(self, route, body=None, stop: threading.Event | None = None, method=None):
         """Return socket, status, headers and an iterator over decoded HTTP body chunks."""
         if stop and stop.is_set():
             raise InterruptedError("Ollama request stopped")
@@ -34,7 +34,7 @@ class Ollama:
             self._active = sock
         try:
             payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-            method = "GET" if body is None else "POST"
+            method = method or ("GET" if body is None else "POST")
             headers = (f"{method} /api{route} HTTP/1.1\r\n"
                        f"Host: {self.host}:{self.port}\r\n"
                        "Connection: close\r\n"
@@ -132,12 +132,12 @@ class Ollama:
                     self._active = None
             sock.close()
 
-    def request(self, route, body=None, stop=None):
-        with self._response(route, body, stop) as (status, chunks):
+    def request(self, route, body=None, stop=None, method=None):
+        with self._response(route, body, stop, method) as (status, chunks):
             contents = b"".join(chunks)
         if status >= 400:
             raise RuntimeError(f"Ollama {route}: HTTP {status} {contents[:400].decode('utf-8', 'replace')}")
-        return json.loads(contents)
+        return json.loads(contents) if contents.strip() else {}
 
     def stream(self, route, body, on_item: Callable, stop=None):
         with self._response(route, body, stop) as (status, chunks):
@@ -184,15 +184,20 @@ class Ollama:
         return self.request("/generate", {"model": model, "prompt": "", "stream": False,
                                           "keep_alive": 0})
 
+    def delete(self, model):
+        return self.request("/delete", {"model": model}, method="DELETE")
+
     def preload(self, model, stop=None):
         return self.request("/generate", {"model": model, "prompt": "", "stream": False,
                                           "keep_alive": "10m"}, stop)
 
-    def generate(self, model, prompt, think, options, stop=None):
+    def generate(self, model, prompt, think, options, stop=None, images=None):
         body = {"model": model, "prompt": prompt, "stream": True, "keep_alive": "10m",
                 "options": options}
         if think is not None:
             body["think"] = think
+        if images:
+            body["images"] = images
         responses, thoughts, final = [], [], None
         def collect(item):
             nonlocal final
@@ -211,6 +216,13 @@ class Ollama:
                             "evalCount": final.get("eval_count") or 0,
                             "evalNs": final.get("eval_duration") or 0,
                             "doneReason": final.get("done_reason") or "unknown"}}
+
+    def chat(self, model, messages, tools, think, options, stop=None):
+        body = {"model": model, "messages": messages, "tools": tools,
+                "stream": False, "keep_alive": "10m", "options": options}
+        if think is not None:
+            body["think"] = think
+        return self.request("/chat", body, stop)
 
     def pull(self, model, progress, stop=None):
         return self.stream("/pull", {"model": model, "stream": True}, progress, stop)

@@ -177,6 +177,11 @@ def interpretation_prompt(task: dict) -> str:
             'Answer using evidence from the passage. State uncertainty when the passage does not settle a claim.')
 
 
+def text_prompt(task: dict) -> str:
+    return (f'Facts and constraints:\n{task["passage"]}\n\nWriting request: {task["question"]}\n'
+            'Return the requested finished text. Do not invent unsupported facts.')
+
+
 def interpretation_validate(task: dict) -> None:
     criteria = task.get("criteria")
     if (not isinstance(task.get("passage"), str) or len(task["passage"]) < 20
@@ -191,6 +196,73 @@ def interpretation_validate(task: dict) -> None:
         raise ValueError("invalid rubric criteria")
 
 
+def structured_prompt(task: dict) -> str:
+    questions = [{"id": item["id"], "question": item["question"]} for item in task["questions"]]
+    return (f'{task["material"]}\n\nAnswer these questions using the supplied material. '
+            'Return only JSON: {"answers":[{"id":"question id","answer":"short answer"}]}. '
+            f'Questions: {compact(questions)}')
+
+
+def structured_validate(task: dict) -> None:
+    if not isinstance(task.get("material"), str) or len(task["material"]) < 20:
+        raise ValueError("material must be at least 20 characters")
+    questions = task.get("questions")
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 20:
+        raise ValueError("1–20 questions required")
+    ids = [item.get("id") for item in questions if isinstance(item, dict)]
+    if (len(ids) != len(questions) or len(set(ids)) != len(ids)
+            or any(not isinstance(item.get("id"), str) or not item["id"]
+                   or not isinstance(item.get("question"), str) or not item["question"]
+                   or not isinstance(item.get("answer"), (str, int, float))
+                   for item in questions)):
+        raise ValueError("invalid questions or answer key")
+    if task.get("category") in {"ocr", "image_recognition"}:
+        image = task.get("image")
+        if (not isinstance(image, str) or not image.startswith("assets/")
+                or ".." in image or not image.lower().endswith(".png")
+                or not isinstance(task.get("imageSha256"), str)
+                or len(task["imageSha256"]) != 64):
+            raise ValueError("versioned PNG image and SHA-256 required")
+    if task.get("category") == "research":
+        sources = task.get("sources")
+        if (not isinstance(sources, list) or not 1 <= len(sources) <= 12
+                or any(not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                       or not isinstance(item.get("title"), str)
+                       or not isinstance(item.get("text"), str) for item in sources)
+                or len({item["id"] for item in sources}) != len(sources)):
+            raise ValueError("research requires 1–12 unique local sources")
+    if task.get("category") == "tools":
+        entries = task.get("entries")
+        if (not isinstance(entries, list) or not 1 <= len(entries) <= 30
+                or any(not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                       or not isinstance(item.get("value"), (str, int, float)) for item in entries)
+                or len({item["id"] for item in entries}) != len(entries)):
+            raise ValueError("tools requires 1–30 unique local entries")
+
+
+def structured_expected(task: dict) -> dict:
+    return {"answers": [{"id": item["id"], "answer": item["answer"]}
+                        for item in task["questions"]]}
+
+
+def structured_grade(task: dict, answer: Any) -> dict:
+    if not isinstance(answer, dict) or not isinstance(answer.get("answers"), list):
+        return {"score": 0, "reason": "Missing answers array"}
+    received = {}
+    for item in answer["answers"]:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            received.setdefault(item["id"], item.get("answer"))
+    def same(actual, expected):
+        if isinstance(actual, bool) or isinstance(expected, bool):
+            return type(actual) is type(expected) and actual == expected
+        if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+            return math.isclose(actual, expected, rel_tol=0, abs_tol=1e-6)
+        return isinstance(actual, str) and actual.strip().casefold() == str(expected).strip().casefold()
+    correct = sum(same(received.get(item["id"]), item["answer"]) for item in task["questions"])
+    return {"score": round(10 * correct / len(task["questions"]), 2),
+            "reason": f'{correct}/{len(task["questions"])} answers correct'}
+
+
 @dataclass(frozen=True)
 class Category:
     id: str
@@ -201,11 +273,21 @@ class Category:
     expected: Callable[[dict], dict] | None = None
     grade: Callable[[dict, Any], dict] | None = None
     requires: tuple[str, ...] = ()
+    mode: str = "generate"
 
 
 CATEGORIES = (
+    Category("text", "Text Production", "subjective", text_prompt, interpretation_validate),
+    Category("long_context", "Long Context", "objective", structured_prompt, structured_validate, structured_expected, structured_grade),
+    Category("research", "Local Research", "objective", structured_prompt, structured_validate, structured_expected, structured_grade, ("tools",), "tools"),
+    Category("tools", "Tool Use", "objective", structured_prompt, structured_validate, structured_expected, structured_grade, ("tools",), "tools"),
+    Category("safety", "Safety Decisions", "objective", structured_prompt, structured_validate, structured_expected, structured_grade),
+    Category("code", "Code Reasoning", "objective", structured_prompt, structured_validate, structured_expected, structured_grade),
+    Category("code_selftest", "Code + Self-test", "objective", structured_prompt, structured_validate, structured_expected, structured_grade),
+    Category("ocr", "OCR", "objective", structured_prompt, structured_validate, structured_expected, structured_grade, ("vision",), "vision"),
     Category("schema", "Schema Recognition", "objective", schema_prompt, schema_validate, schema_expected, schema_grade),
     Category("decision", "Decision Logic", "objective", decision_prompt, decision_validate, decision_expected, decision_grade),
-    Category("interpretation", "Evidence-Based Interpretation", "subjective", interpretation_prompt, interpretation_validate),
+    Category("interpretation", "Text Understanding", "subjective", interpretation_prompt, interpretation_validate),
+    Category("image_recognition", "Image Recognition", "objective", structured_prompt, structured_validate, structured_expected, structured_grade, ("vision",), "vision"),
 )
 REGISTRY = {category.id: category for category in CATEGORIES}

@@ -4,6 +4,7 @@ from datetime import date
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import threading
@@ -13,7 +14,7 @@ import webbrowser
 
 from benchmark.categories import CATEGORIES
 from benchmark.cloud import EFFORTS, generation_prompt
-from benchmark.core import validate_pack
+from benchmark.core import content_hash, validate_pack
 from benchmark.ollama import Ollama
 from benchmark.projection import project_run, valid_limits
 from benchmark.runner import Runner
@@ -32,6 +33,14 @@ class App:
                  runner=None):
         self.root = Path(root)
         self.store = store or Store(Path(os.environ.get("BENCHMARK_DATA_DIR", self.root / "data")))
+        built_in = self.root / "packs" / "broad-draft-v0.2.json"
+        if built_in.is_file():
+            pack = json.loads(built_in.read_text(encoding="utf-8"))
+            digest = content_hash(pack)
+            if not any(item.get("hash") == digest for item in self.store.state["packs"]):
+                result = self.store.add_pack(pack, "built-in draft")
+                if result.get("errors"):
+                    raise ValueError("Built-in pack is invalid: " + "; ".join(result["errors"]))
         self.ollama = ollama or Ollama()
         self.system_snapshot = system_snapshot
         self.runner = runner or Runner(self.store, self.ollama, self.root, system_snapshot)
@@ -39,7 +48,7 @@ class App:
 
     def get(self, path):
         if path == "/api/health":
-            return 200, {"name": "llm-benchmark", "version": "0.1.0"}
+            return 200, {"name": "llm-benchmark", "version": "0.2.0"}
         if path == "/api/state":
             return 200, {**self.store.snapshot(),
                          "categories": [{"id": c.id, "label": c.label, "type": c.type}
@@ -127,6 +136,20 @@ class App:
                 raise ValueError("Model is not currently loaded")
             self.ollama.unload(model)
             return 200, {"unloaded": model}
+        if path == "/api/models/delete":
+            if self.runner.busy():
+                raise ValueError("Finish or stop the current job before deleting a model")
+            name, digest = body.get("model"), body.get("digest")
+            if not isinstance(name, str) or not isinstance(digest, str):
+                raise ValueError("Model name and digest required")
+            installed = next((item for item in self.ollama.models().get("models", [])
+                              if item.get("name") == name), None)
+            if not installed or installed.get("digest") != digest:
+                raise ValueError("The installed model changed; refresh the model list")
+            if any(item.get("name") == name for item in self.ollama.running().get("models", [])):
+                raise ValueError("Unload this model before deleting it")
+            self.ollama.delete(name)
+            return 200, {"deleted": name}
         if path == "/api/cloud/generate":
             return 202, {"job": self.runner.start_cloud(body.get("model"),
                                                          body.get("effort"))}
@@ -166,6 +189,16 @@ def handler_for(app):
             return self.headers.get("Host") in (HOST, f"{HOST}:{PORT}")
 
         def _static(self, path):
+            if re.fullmatch(r"/assets/(?:ocr|board)-[1-5]\.png", path):
+                payload = (app.root / path.lstrip("/")).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             entry = STATIC.get(path)
             if not entry:
                 raise LookupError("Not found")

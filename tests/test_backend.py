@@ -14,6 +14,7 @@ from benchmark.ollama import Ollama
 from benchmark.projection import project_run
 from benchmark.runner import Runner
 from benchmark.store import Store
+from benchmark.task_io import run_tools, run_vision
 from server import App, handler_for
 
 
@@ -42,6 +43,7 @@ class FakeOllama:
     def __init__(self):
         self.calls = 0
         self.unloaded = []
+        self.deleted = []
 
     def models(self):
         return {"models": [{"name": "fake:1", "digest": "fake-digest",
@@ -58,6 +60,9 @@ class FakeOllama:
 
     def unload(self, model):
         self.unloaded.append(model)
+
+    def delete(self, model):
+        self.deleted.append(model)
 
     def cancel(self):
         pass
@@ -97,6 +102,138 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(["review", "accept"], [item["choice"] for item in
                          decision_expected(pack["tasks"][1])["decisions"]])
         self.assertEqual(0, grade_objective(pack["tasks"][1], "bad JSON")["score"])
+        fenced = grade_objective(pack["tasks"][0], '```json\n{"result":[{"id":"one"}]}\n```')
+        self.assertEqual(10, fenced["score"])
+        self.assertFalse(fenced["formatValid"])
+
+    def test_broad_pack_has_five_valid_levels_per_area_and_fixed_images(self):
+        root = Path(__file__).resolve().parents[1]
+        pack = json.loads((root / "packs" / "broad-draft-v0.2.json").read_text(encoding="utf-8"))
+        self.assertEqual([], validate_pack(pack))
+        self.assertEqual(12, len(pack["categoryIds"]))
+        self.assertEqual(60, len(pack["tasks"]))
+        for category in pack["categoryIds"]:
+            self.assertEqual([1, 2, 3, 4, 5], sorted(
+                task["level"] for task in pack["tasks"] if task["category"] == category))
+        vision = [task for task in pack["tasks"] if task["category"] in {"ocr", "image_recognition"}]
+        self.assertEqual(10, len(vision))
+        for task in vision:
+            self.assertTrue((root / task["image"]).is_file())
+
+        class VisionFake:
+            def generate(self, model, prompt, think, options, stop, images):
+                self.assertion = (model, bool(images), len(images[0]))
+                return {"response": "{}", "thinking": "", "metrics": {}}
+
+        fake = VisionFake()
+        run_vision(fake, root, vision[0], "fake:1", False, {}, None)
+        self.assertEqual("fake:1", fake.assertion[0])
+        self.assertTrue(fake.assertion[1])
+        self.assertGreater(fake.assertion[2], 100)
+
+    def test_broad_pack_is_installed_once_as_unapproved_draft(self):
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            fake = FakeOllama()
+            system = lambda: {"warnings": []}
+            app = App(project, store=store, ollama=fake, system_snapshot=system)
+            self.assertEqual(1, len(app.get("/api/state")[1]["packs"]))
+            self.assertFalse(store.state["packs"][0]["approved"])
+            self.assertEqual(60, len(store.state["packs"][0]["tasks"]))
+            App(project, store=store, ollama=fake, system_snapshot=system)
+            self.assertEqual(1, len(store.state["packs"]))
+            self.assertEqual([], store.state["runs"])
+
+    def test_broad_pack_image_and_delete_endpoint_over_http(self):
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeOllama()
+            app = App(project, store=Store(Path(directory)), ollama=fake,
+                      system_snapshot=lambda: {"warnings": []})
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(app))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            headers = {"Host": "127.0.0.1:37843"}
+            try:
+                connection.request("GET", "/api/state", headers=headers)
+                response = connection.getresponse()
+                state = json.loads(response.read())
+                self.assertEqual(200, response.status)
+                self.assertEqual(60, len(state["packs"][0]["tasks"]))
+
+                connection.request("GET", "/assets/board-5.png", headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(200, response.status)
+                self.assertEqual("image/png", response.getheader("Content-Type"))
+                self.assertTrue(response.read().startswith(b"\x89PNG"))
+
+                body = json.dumps({"model": "fake:1", "digest": "fake-digest"})
+                connection.request("POST", "/api/models/delete", body, headers={
+                    **headers, "Content-Type": "application/json",
+                    "X-Benchmark-Token": state["token"]})
+                response = connection.getresponse()
+                self.assertEqual(200, response.status)
+                self.assertEqual({"deleted": "fake:1"}, json.loads(response.read()))
+                self.assertEqual(["fake:1"], fake.deleted)
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+
+    def test_research_tool_reads_only_pack_source(self):
+        task = {"category": "research", "material": "Use the fixed local sources to answer.",
+                "questions": [{"id": "cap", "question": "What is the cap?", "answer": 13}],
+                "sources": [{"id": "S1", "title": "Policy", "text": "The cap is 13."}]}
+        class ToolFake:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, model, messages, tools, think, options, stop):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"message": {"role": "assistant", "content": "", "tool_calls": [
+                        {"function": {"name": "open_source", "arguments": {"id": "S1"}}}]}}
+                self.last_messages = messages
+                return {"message": {"role": "assistant", "content": '{"answers":[{"id":"cap","answer":13}]}'}}
+
+        fake = ToolFake()
+        result = run_tools(fake, task, "fake:1", False, {}, None)
+        self.assertEqual(1, result["validToolCalls"])
+        self.assertEqual(13, json.loads(result["response"])["answers"][0]["answer"])
+        self.assertIn("The cap is 13", fake.last_messages[-1]["content"])
+
+    def test_full_broad_run_completes_with_fake_model_only(self):
+        project = Path(__file__).resolve().parents[1]
+        pack_body = json.loads((project / "packs" / "broad-draft-v0.2.json").read_text(encoding="utf-8"))
+
+        class BroadFake(FakeOllama):
+            def show(self, model):
+                return {"capabilities": ["completion", "vision", "tools"]}
+
+            def generate(self, model, prompt, think, options, stop=None, images=None):
+                return {"response": "{}", "thinking": "", "metrics": {"doneReason": "stop"}}
+
+            def chat(self, model, messages, tools, think, options, stop=None):
+                return {"message": {"role": "assistant", "content": "{}"},
+                        "done_reason": "stop"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            pack = store.add_pack(pack_body)["pack"]
+            store.update(lambda state: pack.update(approved=True))
+            runner = Runner(store, BroadFake(), project,
+                            system_snapshot=lambda: {"warnings": [], "at": "test"})
+            runner.start_benchmark({"packId": pack["id"], "model": "fake:1",
+                                    "digest": "fake-digest", "think": False,
+                                    "numCtx": 4096, "temperature": 0, "numPredict": 1024,
+                                    "limitsSec": [60] * 5, "repetitions": 1})
+            deadline = time.monotonic() + 10
+            while runner.busy() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual("completed", runner.status()["status"], runner.status())
+            self.assertEqual(60, len(store.state["runs"][0]["tasks"]))
+            self.assertEqual(12, len(project_run(store.state["runs"][0], [60] * 5)["categories"]))
 
     def test_subjective_normalization_and_projection(self):
         task = pack_fixture()["tasks"][2]
@@ -127,7 +264,7 @@ class BackendTests(unittest.TestCase):
                       runner=runner)
             code, state = app.get("/api/state")
             self.assertEqual(200, code)
-            self.assertEqual(3, len(state["categories"]))
+            self.assertEqual(12, len(state["categories"]))
             config = {"packId": added["id"], "model": "fake:1",
                       "digest": "fake-digest", "details": {},
                       "think": False, "numCtx": 4096, "temperature": 0,
@@ -173,7 +310,7 @@ class BackendTests(unittest.TestCase):
                 response = connection.getresponse()
                 state = json.loads(response.read())
                 self.assertEqual(200, response.status)
-                self.assertEqual(3, len(state["categories"]))
+                self.assertEqual(12, len(state["categories"]))
                 body = json.dumps({"limitsSec": [60] * 5, "repetitions": 1})
                 connection.request("POST", "/api/settings", body, headers={
                     **headers, "Content-Type": "application/json"})
@@ -190,6 +327,50 @@ class BackendTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_model_delete_requires_current_digest_and_idle_unloaded_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeOllama()
+            store = Store(root / "data")
+            runner = Runner(store, fake, root, system_snapshot=lambda: {"warnings": []})
+            app = App(root, store=store, ollama=fake, runner=runner)
+            with self.assertRaisesRegex(ValueError, "changed"):
+                app.post("/api/models/delete", {"model": "fake:1", "digest": "old"})
+            self.assertEqual((200, {"deleted": "fake:1"}), app.post(
+                "/api/models/delete", {"model": "fake:1", "digest": "fake-digest"}))
+            self.assertEqual(["fake:1"], fake.deleted)
+
+            fake.running = lambda: {"models": [{"name": "fake:1"}]}
+            with self.assertRaisesRegex(ValueError, "Unload"):
+                app.post("/api/models/delete", {"model": "fake:1", "digest": "fake-digest"})
+            self.assertEqual(["fake:1"], fake.deleted)
+            fake.running = lambda: {"models": []}
+            runner._start("pull", "fake:1")
+            with self.assertRaisesRegex(ValueError, "current job"):
+                app.post("/api/models/delete", {"model": "fake:1", "digest": "fake-digest"})
+            self.assertEqual(["fake:1"], fake.deleted)
+
+    def test_ollama_delete_uses_delete_method_and_accepts_empty_response(self):
+        class Stub(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_DELETE(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self.server.seen = (self.path, body)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            self.assertEqual({}, Ollama(port=server.server_port).delete("fake:1"))
+            self.assertEqual(("/api/delete", {"model": "fake:1"}), server.seen)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_abort_discard_current_answer_but_keeps_run_record(self):
         with tempfile.TemporaryDirectory() as directory:

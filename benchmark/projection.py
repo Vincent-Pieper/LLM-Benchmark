@@ -1,6 +1,5 @@
 """Preview historical scores under different time limits without changing data."""
 import math
-from .categories import CATEGORIES
 
 
 def valid_limits(limits):
@@ -11,14 +10,15 @@ def valid_limits(limits):
 def project_run(run, limits):
     if not valid_limits(limits):
         raise ValueError("Five valid processing limits required")
+    category_ids = run.get("categoryIds") or ["schema", "decision", "interpretation"]
     records = []
     for repetition in range(1, run["repetitions"] + 1):
-        for category in CATEGORIES:
+        for category_id in category_ids:
             blocked = False
             for level in range(1, 6):
                 original = next((task for task in run["tasks"] if task.get("repetition") == repetition
-                                 and task.get("category") == category.id and task.get("level") == level), None)
-                base = {"repetition": repetition, "category": category.id, "level": level}
+                                 and task.get("category") == category_id and task.get("level") == level), None)
+                base = {"repetition": repetition, "category": category_id, "level": level}
                 if blocked:
                     records.append({**base, "status": "skipped_due_to_limit", "score": 0,
                                     "reason": "Earlier level exceeds current limit"})
@@ -40,11 +40,11 @@ def project_run(run, limits):
                     records.append({**base, "status": original["status"], "score": original.get("score"),
                                     "reason": original.get("reason", "")})
     category_scores = []
-    for category in CATEGORIES:
-        relevant = [item for item in records if item["category"] == category.id]
+    for category_id in category_ids:
+        relevant = [item for item in records if item["category"] == category_id]
         complete = len(relevant) == 5 * run["repetitions"] and all(
             isinstance(item.get("score"), (int, float)) and math.isfinite(item["score"]) for item in relevant)
-        category_scores.append({"category": category.id,
+        category_scores.append({"category": category_id,
                                 "score": round(sum(item["score"] for item in relevant) / run["repetitions"], 2) if complete else None,
                                 "pending": sum(item.get("score") is None for item in relevant)})
     complete = all(item["score"] is not None for item in category_scores)

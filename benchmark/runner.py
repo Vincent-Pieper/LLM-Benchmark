@@ -10,10 +10,11 @@ import threading
 import time
 from .categories import CATEGORIES, REGISTRY
 from .cloud import generate_pack
-from .core import content_hash, grade_objective, new_id, normalize_judge
+from .core import content_hash, grade_objective, new_id, normalize_judge, pack_categories
 from .projection import valid_limits
 from .store import now
 from .system import snapshot
+from .task_io import run_tools, run_vision
 
 
 COMPLETE = {"scored", "subjective_pending", "unsupported", "timed_out", "skipped_due_to_limit"}
@@ -125,7 +126,7 @@ class Runner:
                         {"scored", "subjective_pending", "unsupported"}] if prior else [])
         run = {"id": new_id(), "profileId": "local", "status": "running", "startedAt": now(),
                "packId": pack["id"], "packHash": pack["hash"], "packName": pack["name"],
-               "packVersion": pack["version"],
+               "packVersion": pack["version"], "categoryIds": pack_categories(pack),
                "setup": {"model": config["model"], "digest": config["digest"],
                          "details": config.get("details"), "think": config.get("think"),
                          "options": {"num_ctx": context, "temperature": temperature,
@@ -163,7 +164,8 @@ class Runner:
         if model.get("digest") != run["setup"]["digest"]:
             raise ValueError("The model digest changed since selection. Refresh models and start a new run.")
         self.store.update(lambda state: run["setup"].update(details=model.get("details")))
-        required = {capability for category in CATEGORIES for capability in category.requires}
+        required = {capability for category_id in pack_categories(pack)
+                    for capability in REGISTRY[category_id].requires}
         capabilities = self.ollama.show(run["setup"]["model"]).get("capabilities", []) if required else []
         self.store.update(lambda state: run["setup"].update(capabilities=capabilities))
         self._unload_all()
@@ -209,9 +211,16 @@ class Runner:
                 started = time.monotonic()
                 timer.start()
                 try:
-                    result = self.ollama.generate(run["setup"]["model"],
-                                                  REGISTRY[task["category"]].prompt(task),
-                                                  run["setup"]["think"], run["setup"]["options"], self.stop)
+                    category = REGISTRY[task["category"]]
+                    if category.mode == "vision":
+                        result = run_vision(self.ollama, self.root, task, run["setup"]["model"],
+                                            run["setup"]["think"], run["setup"]["options"], self.stop)
+                    elif category.mode == "tools":
+                        result = run_tools(self.ollama, task, run["setup"]["model"],
+                                           run["setup"]["think"], run["setup"]["options"], self.stop)
+                    else:
+                        result = self.ollama.generate(run["setup"]["model"], category.prompt(task),
+                                                      run["setup"]["think"], run["setup"]["options"], self.stop)
                     elapsed = round((time.monotonic() - started) * 1000)
                     if timed_out.is_set():
                         raise TimeoutError("Processing limit exceeded")
@@ -223,10 +232,16 @@ class Runner:
                             "metrics": result["metrics"],
                             "truncated": result["metrics"]["doneReason"] == "length",
                             "recordedAt": now()}
+                    if "toolTrace" in result:
+                        base["toolTrace"] = result["toolTrace"]
                     if not subjective:
                         base.update(grade_objective(task, result["response"]))
+                        if category.mode == "tools" and not result["validToolCalls"]:
+                            base.update(score=0, reason="No successful local tool call")
+                    elif not result["response"].strip():
+                        base.update(score=0, reason="Empty final answer")
                     self._save_task(run, task, repetition,
-                                    "subjective_pending" if subjective else "scored", **base)
+                                    "subjective_pending" if subjective and base["score"] is None else "scored", **base)
                 except Exception as exc:
                     elapsed = round((time.monotonic() - started) * 1000)
                     if timed_out.is_set():
@@ -308,7 +323,8 @@ class Runner:
         if not run or not pack or pack["hash"] != run["packHash"]:
             raise ValueError("Run or pack unavailable")
         eligible = [record for record in run["tasks"] if
-                    (REGISTRY[record["category"]].type == "subjective" and isinstance(record.get("raw"), str))
+                    (REGISTRY[record["category"]].type == "subjective" and isinstance(record.get("raw"), str)
+                     and record["raw"].strip())
                     if rejudge or record["status"] in {"subjective_pending", "judge_error"}]
         if not eligible:
             raise ValueError("No subjective answers available for judging")
