@@ -4,7 +4,7 @@ const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = n => Number.isFinite(n) ? n.toLocaleString('en-US',{maximumFractionDigits:2}) : '—';
 const when = value => value ? new Date(value).toLocaleString() : '—';
-let state = null, library = null, system = null, selectedRun = null, lastJobStatus = null;
+let state = null, library = null, system = null, selectedRun = null, lastJobStatus = null, lastJobId = null, pollCount = 0;
 
 async function get(url) {
   const response = await fetch(url,{cache:'no-store'});
@@ -60,6 +60,60 @@ function renderLimits() {
 }
 function readLimits() { const values=[1,2,3,4,5].map(i=>Number($(`limit-${i}`).value)*60); if(values.some(n=>!Number.isInteger(n)||n<1||n>86400))throw new Error('Each task limit must be between 1 and 1440 minutes');return values; }
 async function saveSettings() { await post('/api/settings',{limitsSec:readLimits(),repetitions:+$('repetitions').value,judgeModel:state.settings.judgeModel || ''}); }
+
+function currentConfig() {
+  const pack=chosenPack(),model=chosenModel();
+  if(!pack?.approved)throw new Error('Approve a pack first');
+  if(!model)throw new Error('Select an installed model');
+  return {packId:pack.id,model:model.name,digest:model.digest,
+    think:$('think').value==='default'?null:$('think').value==='true',
+    numCtx:+$('num-ctx').value,temperature:+$('temperature').value,
+    numPredict:+$('num-predict').value,limitsSec:readLimits(),
+    repetitions:+$('repetitions').value};
+}
+
+function renderQueue() {
+  const queue=state?.queue || {status:'idle',items:[]},items=queue.items||[];
+  const pending=items.filter(item=>item.status==='pending');
+  const totalMissing=pending.reduce((count,item)=>count+(item.preview?.missingTasks||0),0);
+  const summary=`${items.length} setup(s) · ${pending.length} pending · ${totalMissing} currently missing task calls`;
+  $('queue-content').innerHTML=`<p class="hint"><span class="tag ${queue.status==='running'?'warn':queue.status==='paused'?'bad':''}">${esc(queue.status)}</span> ${esc(summary)}${queue.pauseRequested?' · pause requested':''}</p>`+
+    (items.length?items.map((item,index)=>{
+      const config=item.config,pack=state.packs.find(p=>p.id===config.packId);
+      const preview=item.preview;
+      const taskText=preview?.error?`Cannot preview: ${preview.error}`:
+        preview?`${preview.missingTasks} of ${preview.totalTasks} task calls missing · ${preview.reusedTasks} saved`:
+        item.status==='running'?'Running now':item.status==='completed'?'Completed':'—';
+      const missingAreas=Object.entries(preview?.missingByCategory||{});
+      const areas=missingAreas.length?`<details class="queue-area-details"><summary>${missingAreas.length} area(s) with missing tasks</summary><small>${missingAreas.map(([category,count])=>`${esc(category)}: ${esc(count)}`).join(' · ')}</small></details>`:'';
+      const canEdit=queue.status!=='running',canMove=canEdit&&item.status==='pending';
+      return `<div class="queue-entry"><div class="queue-entry-main"><strong>${esc(config.model)}</strong> <span class="queue-status ${esc(item.status)}">${esc(item.status)}</span><small>${esc(pack?.name||'Pack unavailable')} · ${esc(window.BenchmarkQueueUI.label(config))}</small><small>Digest ${esc(config.digest.slice(0,12))} · Level limits ${esc(config.limitsSec.map(seconds=>fmt(seconds/60)).join(' / '))} min</small><small>${esc(taskText)}${item.note?' · '+esc(item.note):''}${item.runId?' · run '+esc(item.runId.slice(0,8)):''}</small>${areas}</div><div class="queue-entry-actions"><button class="secondary queue-move" data-id="${esc(item.id)}" data-direction="-1" ${!canMove||index===0||items[index-1].status!=='pending'?'disabled':''} aria-label="Move up">↑</button><button class="secondary queue-move" data-id="${esc(item.id)}" data-direction="1" ${!canMove||index===items.length-1||items[index+1].status!=='pending'?'disabled':''} aria-label="Move down">↓</button>${item.status==='failed'?`<button class="secondary queue-retry" data-id="${esc(item.id)}" ${!canEdit?'disabled':''}>Retry</button>`:''}${item.status==='completed'&&preview?.missingTasks?`<button class="secondary queue-missing" data-id="${esc(item.id)}" ${!canEdit?'disabled':''}>Queue missing</button>`:''}<button class="secondary queue-remove" data-id="${esc(item.id)}" ${!canEdit||item.status==='running'?'disabled':''}>Remove</button></div></div>`;
+    }).join(''):'<p class="muted">Queue is empty. Add a preset or custom setup above.</p>');
+  $('queue-start').disabled=queue.status==='running'||!pending.length;
+  $('queue-pause').disabled=queue.status!=='running';
+  for(const id of ['queue-standard','queue-current','queue-selected'])$(id).disabled=queue.status==='running';
+  $('queue-content').querySelectorAll('.queue-move').forEach(button=>button.onclick=guard(async()=>{
+    state.queue=await post('/api/queue/move',{id:button.dataset.id,direction:Number(button.dataset.direction)});renderQueue();
+  }));
+  $('queue-content').querySelectorAll('.queue-remove').forEach(button=>button.onclick=guard(async()=>{
+    state.queue=await post('/api/queue/remove',{id:button.dataset.id});renderQueue();
+  }));
+  $('queue-content').querySelectorAll('.queue-retry').forEach(button=>button.onclick=guard(async()=>{
+    state.queue=await post('/api/queue/retry',{id:button.dataset.id});renderQueue();
+  }));
+  $('queue-content').querySelectorAll('.queue-missing').forEach(button=>button.onclick=guard(async()=>{
+    const item=state.queue.items.find(item=>item.id===button.dataset.id);
+    const config={...item.config,limitsSec:readLimits()};
+    if(!confirm(`Add missing tasks for ${config.model} using the current level time limits? This does not start a test.`))return;
+    await addQueue([config]);
+  }));
+}
+
+async function addQueue(configs) {
+  state.queue=await post('/api/queue/add',{configs});
+  renderQueue();
+  notice(`${configs.length} setup(s) added to the queue. No test has started.`);
+}
 
 function renderResults() {
   const pack=chosenPack();
@@ -139,10 +193,10 @@ function renderJob(job) {
   el.innerHTML=`<p><span class="tag ${job.status==='completed'?'good':job.status==='failed'?'bad':'warn'}">${esc(job.status)}</span> <strong>${esc(job.type)}</strong> · ${esc(job.detail||'')}</p>${extra}<p class="hint">Started ${esc(when(job.startedAt))}${job.endedAt?' · ended '+esc(when(job.endedAt)):''}</p>`;
   $('after-btn').disabled=!active||job.type!=='benchmark';$('abort-btn').disabled=!active;$('check-btn').disabled=!active||job.type!=='benchmark';
 }
-async function refreshState() { state=await get('/api/state');$('profile-status').textContent=`PC: ${state.profiles?.find(p=>p.id==='local')?.name||'Local'}`;renderPacks();renderResults();if(!window._limitsReady){renderLimits();window._limitsReady=true;}renderJob(state.job); }
+async function refreshState() { state=await get('/api/state');$('profile-status').textContent=`PC: ${state.profiles?.find(p=>p.id==='local')?.name||'Local'}`;renderPacks();renderResults();if(!window._limitsReady){renderLimits();window._limitsReady=true;}renderJob(state.job);renderQueue(); }
 async function refreshModels() { try{library=await get('/api/models');renderModels();renderResults();}catch(e){library=null;renderModels();notice(e.message,true);} }
 async function refreshSystem(){system=await get('/api/system');renderSystem();}
-async function poll(){try{const job=await get('/api/job');renderJob(job);if(job?.status!==lastJobStatus&&job?.status!=='running'){await refreshState();await refreshModels();}lastJobStatus=job?.status||null;}catch{}}
+async function poll(){try{const job=await get('/api/job');renderJob(job);if(job?.id!==lastJobId||(job?.status!==lastJobStatus&&job?.status!=='running')){await refreshState();if(job?.status!=='running')await refreshModels();}else if(++pollCount%4===0&&state?.queue?.status==='running'){state.queue=await get('/api/queue');renderQueue();}lastJobStatus=job?.status||null;lastJobId=job?.id||null;}catch{}}
 
 async function init(){
   await refreshState();
@@ -157,7 +211,32 @@ async function init(){
   $('pull-btn').onclick=guard(async()=>{const model=$('pull-name').value.trim();if(!model)throw new Error('Enter an Ollama model name');if(!confirm(`Download ${model} through Ollama now? The model may be large and the progress will be shown here.`))return;await post('/api/models/pull',{model});notice(`Download of ${model} started.`);});
   $('cloud-btn').onclick=guard(async()=>{const model=$('cloud-model').value.trim(),effort=$('cloud-effort').value;if(!confirm(`Send the generic task-generation prompt to Codex CLI using ${model} / ${effort}?`))return;await post('/api/cloud/generate',{model,effort});notice('Codex is generating a draft. Review and approve it when complete.');});
   $('pack-import').onclick=guard(async()=>{const raw=$('pack-json').value;const result=await post('/api/packs/import',{pack:raw});await refreshState();$('pack-select').value=result.pack.id;renderPackDetail();notice('Draft imported. Review every task before approval.');});
-  $('run-btn').onclick=guard(async()=>{const pack=chosenPack(),model=chosenModel();if(!pack?.approved)throw new Error('Approve a pack first');if(!model)throw new Error('Select an installed model');if(system?.warnings.length&&!$('override-warnings').checked)throw new Error('System Check has warnings. Close other programs and refresh, or explicitly check the override box.');await saveSettings();const config={packId:pack.id,model:model.name,digest:model.digest,details:model.details,think:$('think').value==='default'?null:$('think').value==='true',numCtx:+$('num-ctx').value,temperature:+$('temperature').value,numPredict:+$('num-predict').value,limitsSec:readLimits(),repetitions:+$('repetitions').value,overrideWarnings:$('override-warnings').checked};if(!confirm(`Run ${model.name} on ${pack.name} for ${config.repetitions} repetition(s)? Ollama will unload all currently loaded models first.`))return;await post('/api/run',config);notice('Benchmark started. Completed task records are saved automatically.');await refreshState();});
+  $('run-btn').onclick=guard(async()=>{const config=currentConfig(),pack=chosenPack();if(system?.warnings.length&&!$('override-warnings').checked)throw new Error('System Check has warnings. Close other programs and refresh, or explicitly check the override box.');await saveSettings();config.overrideWarnings=$('override-warnings').checked;if(!confirm(`Run ${config.model} on ${pack.name} for ${config.repetitions} repetition(s)? Ollama will unload all currently loaded models first.`))return;await post('/api/run',config);notice('Benchmark started. Completed task records are saved automatically.');await refreshState();});
+  $('queue-refresh').onclick=guard(async()=>{state.queue=await get('/api/queue');renderQueue();});
+  $('queue-standard').onclick=guard(async()=>{
+    const configs=window.BenchmarkQueueUI.standard(currentConfig(),$('queue-cap').value);
+    await addQueue(configs);
+  });
+  $('queue-current').onclick=guard(async()=>{await addQueue([currentConfig()]);});
+  $('queue-selected').onclick=guard(async()=>{
+    const modes=[...document.querySelectorAll('input[name="queue-mode"]:checked')].map(input=>input.value);
+    const temperatures=[...document.querySelectorAll('input[name="queue-temp"]:checked')].map(input=>Number(input.value));
+    const configs=window.BenchmarkQueueUI.expand(currentConfig(),modes,temperatures,$('queue-cap').value);
+    if(!confirm(`Add ${configs.length} selected setup(s) to the queue? This will save the list but will not start testing.`))return;
+    await addQueue(configs);
+  });
+  $('queue-start').onclick=guard(async()=>{
+    await refreshSystem();
+    const pending=state.queue.items.filter(item=>item.status==='pending');
+    const missing=pending.reduce((sum,item)=>sum+(item.preview?.missingTasks||0),0);
+    if(!pending.length)throw new Error('No pending queue setups');
+    if(system?.warnings.length&&!$('override-warnings').checked)throw new Error('System Check has warnings. Close other programs and refresh, or explicitly check the override box in Run setup.');
+    if(!confirm(`Start ${pending.length} queued setup(s), currently about ${missing} missing task calls? Ollama will unload loaded models. Setups run consecutively; you can stop after the current task.`))return;
+    state.queue=await post('/api/queue/start',{overrideWarnings:$('override-warnings').checked});renderQueue();notice('Queue started. Results are saved after each task.');
+  });
+  $('queue-pause').onclick=guard(async()=>{
+    state.queue=await post('/api/queue/pause',{mode:'after-task'});renderQueue();notice('Queue will pause after the current task.');
+  });
   $('check-btn').onclick=guard(async()=>{const check=await get('/api/job/check');const eta=check.eta;$('eta-content').innerHTML=eta?`<p><strong>Estimated remaining:</strong> ${fmt(eta.remainingMs/60000)} min · finish around ${esc(when(eta.finishAt))} · confidence ${esc(eta.confidence)} (${esc(eta.confidenceScore)}/100) · ${esc(eta.completedSamples)} historical task samples.</p><details><summary>Estimate detail</summary><pre>${esc(JSON.stringify(eta.details,null,2))}</pre></details>`:'<p class="hint">No benchmark is running.</p>';});
   $('after-btn').onclick=guard(async()=>{await post('/api/job/abort',{mode:'after-task'});notice('Will stop after the current task; completed results stay saved.');});
   $('abort-btn').onclick=guard(async()=>{const job=await get('/api/job');const messages={benchmark:'Abort now? The current partial answer will not be scored; completed tasks stay saved.',pull:'Stop this download request? Ollama may retain partial data and resume later.',cloud:'Stop Codex CLI draft generation now?',judge:'Stop local judging now? Already graded answers stay saved.'};if(!confirm(messages[job?.type]||'Abort this job now?'))return;await post('/api/job/abort',{mode:'now'});notice('Abort requested.');});

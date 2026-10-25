@@ -17,6 +17,7 @@ from benchmark.cloud import EFFORTS, generation_prompt
 from benchmark.core import content_hash, validate_pack
 from benchmark.ollama import Ollama
 from benchmark.projection import project_run, valid_limits
+from benchmark.queue import BenchmarkQueue
 from benchmark.runner import Runner
 from benchmark.store import Store, now
 from benchmark.system import codex_exe, snapshot
@@ -27,6 +28,7 @@ HOST, PORT = "127.0.0.1", 37843
 STATIC = {"/": ("index.html", "text/html"), "/index.html": ("index.html", "text/html"),
           "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css"),
           "/comparison.js": ("comparison.js", "text/javascript"),
+          "/queue.js": ("queue.js", "text/javascript"),
           "/results_ui.js": ("results_ui.js", "text/javascript"),
           "/results.css": ("results.css", "text/css")}
 CSP = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'"
@@ -48,18 +50,22 @@ class App:
         self.ollama = ollama or Ollama()
         self.system_snapshot = system_snapshot
         self.runner = runner or Runner(self.store, self.ollama, self.root, system_snapshot)
+        self.queue = BenchmarkQueue(self.store, self.runner, self.ollama)
         self.token = secrets.token_hex(32)
 
     def get(self, path, params=None):
         params = params or {}
         if path == "/api/health":
-            return 200, {"name": "llm-benchmark", "version": "0.3.0"}
+            return 200, {"name": "llm-benchmark", "version": "0.4.0"}
         if path == "/api/state":
             return 200, {**self.store.snapshot(),
                          "categories": [{"id": c.id, "label": c.label, "type": c.type}
                                         for c in CATEGORIES],
-                         "job": self.runner.status(), "token": self.token,
+                         "job": self.runner.status(), "queue": self.queue.snapshot(),
+                         "token": self.token,
                          "codexAvailable": bool(codex_exe())}
+        if path == "/api/queue":
+            return 200, self.queue.snapshot()
         if path == "/api/models":
             models = self.ollama.models()
             running = self.ollama.running()
@@ -120,6 +126,18 @@ class App:
             return 200, {"pack": pack}
         if path == "/api/run":
             return 202, {"run": self.runner.start_benchmark(body)}
+        if path == "/api/queue/add":
+            return 200, self.queue.add(body.get("configs"))
+        if path == "/api/queue/remove":
+            return 200, self.queue.remove(body.get("id"))
+        if path == "/api/queue/move":
+            return 200, self.queue.move(body.get("id"), body.get("direction"))
+        if path == "/api/queue/retry":
+            return 200, self.queue.retry(body.get("id"))
+        if path == "/api/queue/start":
+            return 202, self.queue.start(bool(body.get("overrideWarnings")))
+        if path == "/api/queue/pause":
+            return 200, self.queue.pause(body.get("mode", "after-task"))
         if path == "/api/runs/retry":
             prior = self.store.run(body.get("runId"))
             if not prior:
@@ -142,7 +160,7 @@ class App:
         if path == "/api/models/pull":
             return 202, {"job": self.runner.start_pull(body.get("model"))}
         if path == "/api/models/unload":
-            if self.runner.busy():
+            if self.runner.busy() or self.runner.queue_active:
                 raise ValueError("A job is running")
             model = body.get("model")
             loaded = self.ollama.running()
@@ -151,11 +169,14 @@ class App:
             self.ollama.unload(model)
             return 200, {"unloaded": model}
         if path == "/api/models/delete":
-            if self.runner.busy():
+            if self.runner.busy() or self.runner.queue_active:
                 raise ValueError("Finish or stop the current job before deleting a model")
             name, digest = body.get("model"), body.get("digest")
             if not isinstance(name, str) or not isinstance(digest, str):
                 raise ValueError("Model name and digest required")
+            if any(item["status"] == "pending" and item["config"]["model"] == name
+                   for item in self.queue.snapshot()["items"]):
+                raise ValueError("Remove this model from the pending queue before deleting it")
             installed = next((item for item in self.ollama.models().get("models", [])
                               if item.get("name") == name), None)
             if not installed or installed.get("digest") != digest:
@@ -172,7 +193,10 @@ class App:
                                                          body.get("judgeModel"),
                                                          bool(body.get("rejudge")))}
         if path == "/api/job/abort":
-            self.runner.abort(body.get("mode"))
+            if self.queue.active:
+                self.queue.pause(body.get("mode", "now"))
+            else:
+                self.runner.abort(body.get("mode"))
             return 200, {"job": self.runner.status()}
         raise LookupError("Unknown API endpoint")
 

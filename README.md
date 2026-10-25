@@ -1,4 +1,4 @@
-# LLM Benchmark 0.3
+# LLM Benchmark 0.4
 
 Local Ollama benchmark app with a Python backend and a browser interface. Run
 `Start Benchmark.cmd` to open the app. It listens only on
@@ -52,6 +52,27 @@ benchmark can run. Clicking a run, download, cloud generation, or judge action
 asks for confirmation. Opening the app by itself does not load a model or
 start a benchmark. The optional cloud generator invokes the installed Codex
 CLI only after the corresponding button is confirmed.
+
+The Test queue saves model setups in `data/state.json`. Choose an approved pack
+and installed model in Run setup, then add the three-setup standard preset
+(thinking with a finite output cap, thinking with open output, and non-thinking
+with that same cap, all at temperature 0), add the current setup, or select a
+custom matrix of thinking/output modes and temperatures. Adding never starts a
+test. The queue shows model digest, context, repetitions, time limits and how
+many task calls are still missing in each category. Reorder or remove pending
+entries before clicking **Start queue** and confirming once. Each setup runs
+sequentially; completed answers from an identical pack/model digest/setup are
+reused when they fit the current task time limit. A fully covered setup is
+skipped. Timeouts and technical failures can be retried, while a failed setup
+is marked and the queue continues to the next one. A completed queue item with
+timed-out tasks offers **Queue missing**, using the current level time limits.
+A later System Check warning
+pauses the queue for review. **Stop after current task** or **Abort now** pauses
+the queue and retains completed task records. Closing only the browser tab does
+not stop the queue; stopping the app's terminal pauses it. Starting again
+always requires an explicit click. No queue action downloads a
+model or calls Codex CLI. The output cap includes generated thinking and final
+answer tokens, so a very small cap can leave no final answer.
 
 The existing three-category pack and all saved runs remain available. On
 startup, the app also adds a **draft** pack with twelve areas and five levels

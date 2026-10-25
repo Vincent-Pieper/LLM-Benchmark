@@ -21,6 +21,17 @@ from .task_io import run_tools, run_vision
 
 
 COMPLETE = {"scored", "subjective_pending", "unsupported", "timed_out", "skipped_due_to_limit"}
+REUSABLE = {"scored", "subjective_pending", "unsupported"}
+
+
+def reusable_record(record, limits):
+    """A saved answer can be reused only if it meets the new processing limit."""
+    if record.get("status") not in REUSABLE:
+        return False
+    elapsed = record.get("processingMs")
+    return (record["status"] == "unsupported" or
+            (isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+             and elapsed <= limits[record["level"] - 1] * 1000))
 
 
 def ordered_tasks(pack):
@@ -37,6 +48,7 @@ class Runner:
         self.lock = threading.RLock()
         self.job = None
         self.stop = None
+        self.queue_active = False
         if any(run["status"] == "running" for run in store.state["runs"]):
             def interrupt(state):
                 for run in state["runs"]:
@@ -53,8 +65,10 @@ class Runner:
         with self.lock:
             return copy.deepcopy(self.job)
 
-    def _start(self, kind, detail):
+    def _start(self, kind, detail, from_queue=False):
         with self.lock:
+            if self.queue_active and not from_queue:
+                raise ValueError("The benchmark queue is running")
             if self.busy():
                 raise ValueError("Another operation is running")
             self.stop = threading.Event()
@@ -98,9 +112,7 @@ class Runner:
         for model in self.ollama.running().get("models", []):
             self.ollama.unload(model.get("name") or model.get("model"))
 
-    def start_benchmark(self, config, retry_of=None):
-        if self.busy():
-            raise ValueError("Another operation is running")
+    def validate_benchmark(self, config):
         pack = self.store.pack(config.get("packId"))
         if not pack or not pack.get("approved"):
             raise ValueError("Choose an approved pack")
@@ -119,16 +131,32 @@ class Runner:
             raise ValueError("Output token limit must be -1 (open-ended) or 32–32768")
         if config.get("think") not in (True, False, None):
             raise ValueError("think must be true, false, or default")
+        if not isinstance(config.get("model"), str) or not config["model"]:
+            raise ValueError("Model name required")
+        if not isinstance(config.get("digest"), str) or not config["digest"]:
+            raise ValueError("Model digest required")
+        return pack
+
+    def start_benchmark(self, config, retry_of=None, from_queue=False):
+        pack = self.validate_benchmark(config)
+        limits = config["limitsSec"]
+        repetitions = config["repetitions"]
+        context, temperature, predict = config["numCtx"], config["temperature"], config["numPredict"]
         prior = self.store.run(retry_of) if retry_of else None
         if retry_of and (not prior or prior["packHash"] != pack["hash"]
                          or prior["setup"]["model"] != config.get("model")
-                         or prior["setup"]["digest"] != config.get("digest")):
-            raise ValueError("Retry requires the same pack and exact installed model digest")
+                         or prior["setup"]["digest"] != config.get("digest")
+                         or prior["setup"].get("think") != config.get("think")
+                         or prior["setup"]["options"] != {"num_ctx": context,
+                                                             "temperature": temperature,
+                                                             "num_predict": predict}
+                         or prior["repetitions"] != repetitions):
+            raise ValueError("Retry requires the same pack, setup, and installed model digest")
         system_before = self.system_snapshot()
         if system_before["warnings"] and not config.get("overrideWarnings"):
             raise ValueError("System Check needs acknowledgement: " + " ".join(system_before["warnings"]))
-        old_records = ([copy.deepcopy(record) for record in prior["tasks"] if record["status"] in
-                        {"scored", "subjective_pending", "unsupported"}] if prior else [])
+        old_records = ([copy.deepcopy(record) for record in prior["tasks"]
+                        if reusable_record(record, limits)] if prior else [])
         run = {"id": new_id(), "profileId": "local", "status": "running", "startedAt": now(),
                "packId": pack["id"], "packHash": pack["hash"], "packName": pack["name"],
                "packVersion": pack["version"], "categoryIds": pack_categories(pack),
@@ -140,7 +168,7 @@ class Runner:
                "retryOf": retry_of, "systemBefore": system_before, "coldLoadMs": None,
                "ollamaVersion": None, "error": None,
                "telemetry": {"intervalSec": INTERVAL_SECONDS, "status": "pending"}}
-        self._start("benchmark", f'{config["model"]} · {pack["name"]}')
+        self._start("benchmark", f'{config["model"]} · {pack["name"]}', from_queue=from_queue)
         with self.lock:
             self.job["runId"] = run["id"]
         try:
